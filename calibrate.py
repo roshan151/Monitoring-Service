@@ -13,7 +13,7 @@ calibrations/<time>.json. It changes nothing on the robot by itself.
     python calibrate.py all          everything below, in order
     python calibrate.py check        health: power, devices, firmware, ToF, IMU, camera (+ buzzer, OLED)
     python calibrate.py encoders     hand-roll each track: counts go up, on the right side   (robot lifted)
-    python calibrate.py imu          level, nose up, left side up: pitch and roll signs; optional drift
+    python calibrate.py imu          level, nose up, left side up, a left turn: pitch, roll and yaw signs; drift
     python calibrate.py tof          ToF orientation (floor rows, hand on the left) + a camera/ToF overlay picture
     python calibrate.py tfluna       the TF-Luna's floor range for the drop guard
     python calibrate.py head         head directions, pan zero (wall), tilt zero and head height (floor)
@@ -21,7 +21,7 @@ calibrations/<time>.json. It changes nothing on the robot by itself.
                                      readings), ticks_per_degree (gyro, 2 full turns), REVERSE_TRIM_PCT
     python calibrate.py service      the Vision-Microservice on this Mac: health and detect latency (no Pi needed)
 
-Options: --host user@pi (remembered in ~/.config/robot-calibrate.json), --repo path on the Pi
+Options: --host user@pi (remembered in .calibrate.json here), --repo path on the Pi
 (default ~/Robot-RPi-Core), --service http://127.0.0.1:8080
 """
 
@@ -42,7 +42,7 @@ from pathlib import Path
 from urllib import request
 
 HERE = Path(__file__).resolve().parent
-CONFIG = Path.home() / ".config" / "robot-calibrate.json"
+CONFIG = HERE / ".calibrate.json"            # the Pi's address and repo path, remembered between runs
 MODES = ["check", "encoders", "imu", "tof", "tfluna", "head", "drive", "service"]
 ALL = ["check", "encoders", "imu", "tof", "tfluna", "head", "drive"]
 
@@ -68,7 +68,7 @@ def countdown(seconds: int, what: str) -> None:
     sys.stdout.write("\r   go!" + " " * 30 + "\n")
 
 
-def tape_cm(what: str, seconds: int = 30) -> float:
+def tape_cm(what: str, seconds: int = 45) -> float:
     countdown(seconds, f"Measure with a tape: {what}")
     while True:
         a = input("   tape reading in cm: ").strip().replace(",", ".")
@@ -205,9 +205,9 @@ def mode_encoders(pi: Pi, res: Results) -> None:
     print("\n== encoders: lift the robot so both tracks are off the floor")
     for side in ("left", "right"):
         other = "right" if side == "left" else "left"
-        countdown(10, f"Get ready to roll the {side.upper()} track FORWARD by hand (the way the robot drives), "
-                      f"for 5 s once it says go")
-        w = pi("encoders_watch", seconds=5)
+        countdown(15, f"Get ready to roll the {side.upper()} track FORWARD by hand (the way the robot drives), "
+                      f"for 8 s once it says go")
+        w = pi("encoders_watch", seconds=8)
         if w[side] > 50 and abs(w[other]) < 0.2 * w[side]:
             res.check(f"{side} encoder", True, f"{w[side]} ticks forward")
         elif w[side] < -50:
@@ -223,14 +223,17 @@ def mode_encoders(pi: Pi, res: Results) -> None:
 
 def mode_imu(pi: Pi, res: Results) -> None:
     print("\n== imu")
-    countdown(5, "Robot on flat floor, still")
-    lv = pi("imu_read", seconds=2)
-    res.check("IMU level", abs(lv["pitch_deg"]) < 3 and abs(lv["roll_deg"]) < 3,
-              f"pitch {lv['pitch_deg']:+.1f}, roll {lv['roll_deg']:+.1f} (flat floor should read near 0)")
+    countdown(10, "Robot on flat floor, still")
+    lv = pi("imu_read", seconds=3)
+    res.check("IMU level", abs(lv["pitch_deg"]) < 15 and abs(lv["roll_deg"]) < 3,
+              f"pitch {lv['pitch_deg']:+.1f}, roll {lv['roll_deg']:+.1f} on flat floor (roll should be near 0; "
+              "over 15 deg pitch: is the board mounted as imu_axes says?)")
+    res.set("/drivetrain", "imu_pitch_offset_deg", round(lv["pitch_deg"], 1),
+            "pitch read on flat floor: taken off every reading, so flat reads 0")
     for what, key, label in (("Lift the FRONT about 3 cm and hold it", "pitch_deg", "pitch"),
                              ("Lift the LEFT side about 3 cm and hold it", "roll_deg", "roll")):
-        countdown(6, what)
-        r = pi("imu_read", seconds=2)
+        countdown(12, what + " (it measures for 4 s once it says go)")
+        r = pi("imu_read", seconds=4)
         moved = r[key] - lv[key]
         other = (r["roll_deg"] - lv["roll_deg"]) if key == "pitch_deg" else (r["pitch_deg"] - lv["pitch_deg"])
         if moved > 2:
@@ -242,6 +245,18 @@ def mode_imu(pi: Pi, res: Results) -> None:
         else:
             res.check(f"IMU {label}", False, f"barely moved ({moved:+.1f}): was it lifted? imu_axes?")
         print("   put it down")
+    # Yaw: the heading follow and explore steer by. A wrong sign here makes every turn look backwards.
+    countdown(12, "When it says go: turn the robot LEFT (anticlockwise seen from above) about a quarter turn, "
+                  "on the floor, within 10 s")
+    r = pi("imu_read", seconds=10)
+    turned = r["yaw_end_deg"] - r["yaw_start_deg"]
+    if turned > 45:
+        res.check("IMU yaw", True, f"{turned:+.0f} deg for a left turn")
+    elif turned < -45:
+        res.check("IMU yaw", False, f"reads {turned:+.0f} for a LEFT turn (should be +): the z entry of imu_axes "
+                  "is the wrong way; flip it, then re-run imu to re-check pitch and roll")
+    else:
+        res.check("IMU yaw", False, f"only {turned:+.0f} deg: was it turned a quarter turn? (gyro on z?)")
     if yes("Run the 60 s gyro drift check (robot still)?", False):
         countdown(5, "Leave the robot completely still")
         d = pi("imu_drift", seconds=60)
@@ -250,7 +265,7 @@ def mode_imu(pi: Pi, res: Results) -> None:
 
 def mode_tof(pi: Pi, res: Results) -> None:
     print("\n== tof: orientation")
-    countdown(8, "Robot on the floor, open space ahead (at least 1.5 m)")
+    countdown(15, "Robot on the floor, open space ahead (at least 1.5 m)")
     rows = pi("level_grid")["rows"]
     show_grid(rows)
     far = lambda r: statistics.mean(4.0 if v is None else v for v in r)       # noqa: E731
@@ -271,8 +286,8 @@ def mode_tof(pi: Pi, res: Results) -> None:
         res.set("/explorer", "tof_tilt", new, f"floor in the {floor} columns; run 'calibrate.py tof' again after "
                 "(floor then in the top rows: add 180)")
         return                                         # the hand test means nothing until this is right
-    countdown(8, "Hold a hand about 25 cm in front of the head, on the ROBOT'S LEFT, and keep it there")
-    near = pi("watch_grid", seconds=3)["rows"] or []
+    countdown(15, "Hold a hand about 25 cm in front of the head, on the ROBOT'S LEFT, and keep it there")
+    near = pi("watch_grid", seconds=5)["rows"] or []
     cols = [c for row in near for c, v in enumerate(row) if v is not None and v < 0.45]
     if not cols:
         res.check("ToF columns", False, "no hand seen within 45 cm: try again a little closer")
@@ -288,7 +303,7 @@ def mode_tof(pi: Pi, res: Results) -> None:
             import cv2
             import numpy as np
             sys.path.insert(0, str(HERE))
-            import sensor_view
+            import tof_camera_overlaid as sensor_view
             img = cv2.imdecode(np.frombuffer(base64.b64decode(snap["jpeg"]), np.uint8), cv2.IMREAD_GRAYSCALE)
             meta = {"session": "calibrate", "n": 0, "geometry": snap["geometry"], "tof": {"rows": snap["rows"]}}
             out = HERE / "calibrations" / f"tof-overlay-{datetime.now():%Y%m%d-%H%M%S}.png"
@@ -303,7 +318,7 @@ def mode_tof(pi: Pi, res: Results) -> None:
 
 def mode_tfluna(pi: Pi, res: Results) -> None:
     print("\n== tfluna: floor range for the drop guard")
-    countdown(8, "Robot on flat floor, nothing within 1 m in front of it")
+    countdown(15, "Robot on flat floor, nothing within 1 m in front of it")
     r = pi("tfluna", seconds=3)
     ok = r["spread_cm"] <= 3 and r["missed"] <= r["readings"] // 4
     res.check("TF-Luna on the floor", ok, f"{r['median_cm']} cm, spread {r['spread_cm']} cm, "
@@ -313,18 +328,18 @@ def mode_tfluna(pi: Pi, res: Results) -> None:
 
 def mode_head(pi: Pi, res: Results) -> None:
     print("\n== head")
-    countdown(5, "Watch the head: it goes LEFT, RIGHT, UP, DOWN, then centre")
+    countdown(10, "Watch the head: it goes LEFT, RIGHT, UP, DOWN, then centre")
     pi("head_moves")
     ok = yes("   Was it left, right, up, down, in that order?")
     res.check("head directions", ok, "" if ok else "flip pan_invert (left/right) or tilt_invert (up/down) in /explorer")
-    countdown(30, "Put the robot square-on to a flat wall 0.6-1.5 m away (back it against a straight edge "
+    countdown(45, "Put the robot square-on to a flat wall 0.6-1.5 m away (back it against a straight edge "
                   "parallel to the wall)")
     p = pi("pan_sweep")
     res.check("pan zero", abs(p["pan_zero_deg"]) < 0.5, f"head truly faces straight at {p['pan_zero_deg']:+.2f} deg "
               f"(wall {p['wall_m']:.2f} m)")
     if abs(p["pan_zero_deg"]) >= 0.5:
         res.set("/explorer", "pan_center_us", p["pan_center_us"], f"pan zero was {p['pan_zero_deg']:+.2f} deg off")
-    countdown(20, "Turn the robot to face open, flat floor: nothing within 2 m in front")
+    countdown(30, "Turn the robot to face open, flat floor: nothing within 2 m in front")
     t = pi("tilt_sweep")
     res.check("tilt zero", abs(t["tilt_error_deg"]) < 0.5 and t["height_spread_m"] < 0.02,
               f"head points {t['tilt_error_deg']:+.2f} deg from where it is told; floor fit spread "
@@ -336,7 +351,7 @@ def mode_head(pi: Pi, res: Results) -> None:
 
 def mode_drive(pi: Pi, res: Results) -> None:
     print("\n== drive: distance, ToF ranges, turns, track trim")
-    countdown(30, "Put the robot square-on to a flat wall, 0.5-0.8 m from it, with 1.5 m clear BEHIND it")
+    countdown(45, "Put the robot square-on to a flat wall, 0.5-0.8 m from it, with 1.5 m clear BEHIND it")
     w0 = pi("wall")
     if w0["corner_ratio"] is not None:
         perp = w0["corner_ratio"] < 1.1
@@ -363,8 +378,23 @@ def mode_drive(pi: Pi, res: Results) -> None:
         return
     if not yes("The robot will now turn a full circle RIGHT, then LEFT, on the spot. Clear around it?"):
         return
-    turns = [pi("move", op=op, value=360) for op in ("right", "left")]
-    meas = [abs(t["yaw_deg"]) for t in turns if t.get("yaw_deg") is not None]
+    turns, meas = [], []
+    for op in ("right", "left"):
+        print(f"   Mark where the robot's nose points now; it turns a full circle {op.upper()}.")
+        t = pi("move", op=op, value=360)
+        turns.append(t)
+        gyro = abs(t["yaw_deg"]) if t.get("yaw_deg") is not None else None
+        a = input(f"   How far did it really turn, in degrees (one full circle = 360"
+                  f"{f'; Enter = the gyro: {gyro:.0f}' if gyro else ''})? ").strip()
+        try:
+            real = float(a) if a else gyro
+        except ValueError:
+            real = gyro
+        if real:
+            meas.append(real)
+            if gyro and abs(gyro - real) > 15:
+                res.check(f"gyro on the {op} turn", False, f"gyro said {gyro:.0f}, you saw {real:.0f}: "
+                          "the gyro's heading is off (imu_axes, or it was not zeroed: run 'calibrate.py imu')")
     if meas:
         tf = pi("fit", kind="turn", commanded=[360] * len(meas), measured=meas)
         res.check("turns", all(abs(m - 360) < 5 for m in meas), f"told 360, turned {tf['turned_deg']}")
@@ -446,8 +476,10 @@ def main() -> None:
     cfg = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     host = a.host or cfg.get("host") or input("Pi SSH address (user@hostname or user@ip): ").strip()
     repo = a.repo or cfg.get("repo") or "~/Robot-RPi-Core"
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps({"host": host, "repo": repo}))
+    try:
+        CONFIG.write_text(json.dumps({"host": host, "repo": repo}))
+    except OSError as e:                                    # only a convenience: never stop for it
+        print(f"(could not remember the address in {CONFIG}: {e}; pass --host next time)")
     if subprocess.run(["ssh", "-o", "ConnectTimeout=8", host, "true"]).returncode != 0:
         raise SystemExit(f"cannot SSH to {host}: check the address (--host), the network, and your SSH key")
     stopped = False

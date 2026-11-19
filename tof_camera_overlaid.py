@@ -7,10 +7,10 @@ It reads the files Vision-Microservice stores for the robot's debug mode
 (robot.yaml /voice debug_mode: true); it makes no network calls and puts no load on
 the robot. Default folder: ../Vision-Microservice/debug, or VS_DEBUG_DIR, or --data.
 
-    python sensor_view.py                          live: the newest upload, as it arrives
-    python sensor_view.py --list                   the saved sessions
-    python sensor_view.py --session 20261118-104200   step through a saved session
-    python sensor_view.py --snapshot view.png      the newest (or --session [--n N]) to a PNG
+    python tof_camera_overlaid.py                          live: the newest upload, as it arrives
+    python tof_camera_overlaid.py --list                   the saved sessions
+    python tof_camera_overlaid.py --session 20261118-104200   step through a saved session
+    python tof_camera_overlaid.py --snapshot view.png      the newest (or --session [--n N]) to a PNG
 
 Keys: q / Esc quit · space pause / play · n or -> next · p or <- previous
       i image on / off · d range numbers on / off · s save the view as PNG
@@ -156,6 +156,12 @@ def render(meta: dict, img: Optional[np.ndarray], show_image: bool = True, show_
     line2 = (f"ToF {tof['age_ms']:+d} ms vs image" if tof.get("age_ms") is not None else "no ToF grid") + \
             (f"   robot->Mac {up} ms" if up is not None else "") + \
             (f"   on screen {shown} ms after it arrived" if shown is not None and mode == "LIVE" else "")
+    note = meta.get("note") or {}
+    if note.get("task") == "follow":                 # what follow made of this frame
+        line1 += (f"   follow #{note.get('seq')}: {note.get('state')} {note.get('target') or ''}"
+                  f" bearing {note.get('bearing_deg')} dist {note.get('distance_m')} ({note.get('distance_from')})"
+                  f" -> turn {note.get('turn_deg')} drive {note.get('drive_m')}"
+                  + ("" if note.get("pose") else "  NO POSE"))
     ex = meta.get("extras") or {}
     if ex.get("pitch_deg") is not None:
         line2 += f"   pitch {ex['pitch_deg']:.1f} deg"
@@ -178,7 +184,7 @@ def render(meta: dict, img: Optional[np.ndarray], show_image: bool = True, show_
 # --------------------------------------------------------------------------- the window
 
 def run(data: Path, session: Optional[str]) -> None:
-    win = "Monitoring-Sensors: camera + ToF"
+    win = "Monitoring-Service: camera + ToF"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     live = session is None
     frames = session_frames(data, session) if session else []

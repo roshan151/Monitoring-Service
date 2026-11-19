@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.DS_Store
+# views saved with the s key
+view-*.png
+# calibration runs and the Pi address (calibrate.py)
+calibrations/
+.calibrate.json
+test-runs/
