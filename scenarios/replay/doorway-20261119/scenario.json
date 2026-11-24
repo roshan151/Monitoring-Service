@@ -1,0 +1,15 @@
+{
+  "about": "Nov 19 4:26 pm: followed Roshan to a doorway, then lost him going into the next room (door-frame ranges, plan flipping between doorway and wall)",
+  "session": "20261119-182630",
+  "saved": "2026-11-20T01:31:43",
+  "limits": {
+    "mac_bad_accepted": 0,
+    "pi_goal_jumps": 1,
+    "pi_placed_too_near": 0,
+    "pivot_flip_episodes": 1
+  },
+  "known": {
+    "pi_goal_jumps": "1 left (step 251): floor distances near the picture's edge jump because the camera's fisheye distortion is not corrected; target 0",
+    "pivot_flip_episodes": "1 left, 3 as recorded: the planner now keeps the goal on the person's side of the wall (target) and asks for room beyond DWA's margin; the one left is where the map did not yet have the wall. Target 0."
+  }
+}

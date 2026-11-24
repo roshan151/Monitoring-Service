@@ -7,3 +7,4 @@ view-*.png
 calibrations/
 .calibrate.json
 test-runs/
+reports/

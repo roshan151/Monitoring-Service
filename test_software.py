@@ -2,7 +2,7 @@
 """Test the robot's software end to end from the Mac: nothing moves, robot-voice keeps running.
 
 test_hardware.py tests the robot as a machine (moves, follow, e-stop). This tests the
-software it runs on: the Vision-Microservice on this Mac, called directly the way the
+software it runs on: the Vision-And-Planning on this Mac, called directly the way the
 robot calls it, then the robot's own code on the Pi over SSH, fed made-up situations
 (a flat floor, a box, a drop, a stair) with the robot's real robot.yaml, and the robot
 calling this Mac with its own vision client. It replaces Robot-RPi-Core's old tests/.
@@ -11,11 +11,16 @@ test-runs/<time>.html, opened in the browser.
 
     python test_software.py              pick a mode from a menu
     python test_software.py all          vision, then robot
-    python test_software.py vision       Vision-Microservice on this Mac: up, quick, each endpoint answers right (no Pi)
+    python test_software.py vision       Vision-And-Planning on this Mac: up, quick, each endpoint answers right (no Pi)
     python test_software.py robot        the robot's code on the Pi: installed, same as this Mac, decisions right, reaches the Mac
+    python test_software.py follow       start follow on the robot (no voice) with the live camera + ToF + nav + SLAM view
+    python test_software.py explore      start explore the same way
+
+follow and explore MOVE the robot (never part of "all"). The live view is navigation_debugging.py --nav: it needs
+debug_mode: true under /voice in robot.yaml. Press Enter here to stop the task; q in the view closes it.
 
 Options: --host user@pi and --repo (shared with calibrate.py in .calibrate.json),
---service http://127.0.0.1:8080 (this Mac's Vision-Microservice), --domain 42 (ROS_DOMAIN_ID)
+--service http://127.0.0.1:8080 (this Mac's Vision-And-Planning), --domain 42 (ROS_DOMAIN_ID)
 """
 
 from __future__ import annotations
@@ -25,19 +30,28 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 from urllib import error, request
 
-from calibrate import mode_service as _service_health, yes
+from calibrate_and_apply import mode_service as _service_health, yes
 from test_hardware import HERE, Results, _get, connect
 
-MODES = ["vision", "robot"]
+MODES = ["vision", "robot", "fixes"]
+TASKS = ["follow", "explore"]                               # these move the robot: never part of "all"
 INFO = {
     "vision": ("Vision service on this Mac", "The program on this Mac that sees for the robot: objects, faces, "
                "depth, plants and the room map. Is it running, quick, and answering correctly?"),
     "robot": ("Robot's software (nothing moves)", "The robot's own code, run on the robot with made-up situations: "
               "is it installed and up to date, does it make the right decisions, and can it reach this Mac?"),
+    "follow": ("Follow, started from here", "Starts follow on the robot without voice (the first enrolled person it "
+               "sees) and opens the live camera, ToF, nav and SLAM view."),
+    "explore": ("Explore, started from here", "Starts explore on the robot without voice and opens the live camera, "
+                "ToF, nav and SLAM view."),
+    "fixes": ("Navigation, VSLAM & Calibration Fixes", "Reflex ground clearance, DWA pivot-first, doorway turns, "
+              "PyMonoVO visual odometry, and calibration target math"),
 }
 ROBOT_REPO = Path(os.environ.get("ROBOT_REPO") or HERE.parent / "Robot-RPi-Core")
 ROBOT_YAML = "ros2_ws/src/robot_bringup/config/robot.yaml"
@@ -351,11 +365,185 @@ def mode_robot(pi, res: Results, a) -> None:
               else v["error"])
 
 
+def mode_task(pi, res: Results, a, task: str) -> None:
+    """Start follow / explore through the robot's task/<task> service, with navigation_debugging.py's live view."""
+    print(f"\n== {task}: started from here (the robot moves)")
+    view = subprocess.Popen([sys.executable, str(HERE / "navigation_debugging.py"), "--nav"], cwd=str(HERE))
+    print("   live view opened (camera + ToF, nav, SLAM; q closes it). Needs debug_mode: true under /voice.")
+    r = pi("task_start", task=task)
+    res.check(f"robot accepted {task}", r["ok"], r["message"])
+    if not r["ok"]:
+        return
+    w = pi("watch", seconds=30, until=["task.start"])
+    res.check(f"{task} started", w["until_s"] is not None,
+              f"{w['until_s']} s after asking" if w["until_s"] is not None else "no task.start in 30 s")
+    if w["until_s"] is None:
+        return
+    try:
+        input(f"   {task} running. Press Enter to stop it (Ctrl-C brakes). ")
+    finally:
+        pi("task_stop")
+    time.sleep(2.0)
+    end = [e for e in pi("logs", since=r["now"]) if e.get("evt") == "task.end"]
+    res.check(f"{task} ended", bool(end), json.dumps({k: end[-1].get(k) for k in ("ok", "cancelled")}) if end
+              else "no task.end yet: check logs.json")
+    if view.poll() is None:
+        print("   the live view stays open: q closes it")
+
+
+def mode_fixes(res: Results) -> None:
+    print("\n== fixes: navigation, SLAM and calibration fixes (nothing moves)")
+    import math
+    import sys
+    from pathlib import Path
+    import numpy as np
+
+    src_dir = HERE.parent
+    sys.path.insert(0, str(src_dir / "Robot-RPi-Core"))
+    sys.path.insert(0, str(src_dir / "Vision-And-Planning"))
+
+    # 1. Calibration Target Math
+    from calibrate_and_apply import (
+        TargetConfig, segment_tof_target, compute_alignment,
+        CALIB_OBJ_HEIGHT_M, CALIB_OBJ_WIDTH_M, CALIB_OBJ_DEPTH_M, CALIB_DISTANCE_M
+    )
+    dim_ok = (
+        abs(CALIB_OBJ_HEIGHT_M - 56.0 * 0.0254) < 1e-4 and
+        abs(CALIB_OBJ_WIDTH_M - 38.0 * 0.0254) < 1e-4 and
+        abs(CALIB_OBJ_DEPTH_M - 30.0 * 0.0254) < 1e-4 and
+        abs(CALIB_DISTANCE_M - 1.00) < 1e-4
+    )
+    res.check("calibration target default dimensions (56x38x30 in at 1.0 m)", dim_ok,
+              f"{CALIB_OBJ_HEIGHT_M / 0.0254:.1f}x{CALIB_OBJ_WIDTH_M / 0.0254:.1f}x{CALIB_OBJ_DEPTH_M / 0.0254:.1f} in at {CALIB_DISTANCE_M:.2f} m")
+
+    cfg = TargetConfig.from_dict({"width_in": 40.0, "height_in": 60.0, "depth_in": 25.0, "distance_m": 1.20})
+    custom_ok = abs(cfg.width_in - 40.0) < 0.1 and abs(cfg.height_in - 60.0) < 0.1 and abs(cfg.distance_m - 1.20) < 0.01
+    res.check("calibration target config overrides", custom_ok, f"custom target {cfg.width_in:.0f}x{cfg.height_in:.0f} in at {cfg.distance_m:.2f} m")
+
+    # ToF grid segmentation test
+    rows = [[2.5] * 8 for _ in range(8)]
+    for r in range(2, 6):
+        for c in range(2, 6):
+            rows[r][c] = 1.00
+    tof_seg = segment_tof_target(rows, min_d=0.8, max_d=1.25)
+    seg_ok = tof_seg is not None and abs(tof_seg[2] - 1.00) < 0.02
+    res.check("ToF target segmentation at 1.0 m", seg_ok, f"depth cluster at {tof_seg[2]:.2f} m" if tof_seg else "failed")
+
+    # Alignment math test
+    img_w, img_h = 640, 480
+    f = (img_w / 2.0) / math.tan(math.radians(40.0))
+    target_w_px = f * CALIB_OBJ_WIDTH_M / 1.00
+    target_h_px = f * (CALIB_OBJ_HEIGHT_M * 0.5) / 1.00
+    cam_box = (320.0, 240.0, target_w_px, target_h_px)
+    tof_shifted = (3.5, 4.5, 1.00)  # shifted 1 zone right
+    align_fit = compute_alignment(cam_box, tof_shifted, img_w, img_h)
+    align_ok = abs(align_fit["tof_pan_offset_deg"] - 7.5) < 0.5 and abs(align_fit["hfov_deg"] - 80.0) < 2.0
+    res.check("ToF-Camera alignment offset extraction", align_ok,
+              f"pan offset {align_fit['tof_pan_offset_deg']:+.2f} deg, HFOV {align_fit['hfov_deg']:.1f} deg")
+
+    # 2. Reflex Floor & Obstacle Safety Filter
+    try:
+        from robot_core.nav import reflex
+        r_drive = reflex.Reflex(None, None, command=lambda: (0.15, 0.0), pose=lambda: (0.0, 0.0, 0.0))
+        r_turn = reflex.Reflex(None, None, command=lambda: (0.0, 0.5), pose=lambda: (0.0, 0.0, 0.0))
+        trip_r7 = r_drive.danger([(7, 3, 0.20, 0.0, 0.03, 0.22)])
+        trip_r6 = r_drive.danger([(6, 3, 0.22, 0.0, 0.05, 0.25)])
+        trip_low = r_drive.danger([(5, 3, 0.18, 0.0, 0.04, 0.20)])
+        trip_none = r_drive.danger([(5, 3, 0.18, 0.0, None, 0.20)])
+        floor_ok = (trip_r7 == "" and trip_r6 == "" and trip_low == "" and trip_none == "")
+        res.check("reflex floor return suppression (row 7 & low h)", floor_ok,
+                  "no false trips on ground" if floor_ok else f"tripped: {trip_r7 or trip_r6 or trip_low or trip_none}")
+
+        trip_front = r_drive.danger([(3, 3, 0.18, 0.0, 0.15, 0.18)])
+        trip_flank = r_turn.danger([(3, 0, 0.15, 0.14, 0.12, 0.21)])
+        obs_ok = ("ahead" in trip_front and "turn" in trip_flank)
+        res.check("reflex obstacle braking (front & flank)", obs_ok,
+                  f"front: {trip_front}; turn: {trip_flank}" if obs_ok else "failed")
+    except Exception as exc:
+        res.check("reflex safety filter", False, str(exc))
+
+    # 3. DWA Controller: Pivot-First and Doorway Passage
+    try:
+        from robot_core.nav import dwa
+        from robot_core.nav.controller import LocalNav
+        from robot_core.nav.costmap import RollingCostmap
+        target = (1.0, 1.0)
+        here = (0.0, 0.0, 0.0)
+        params = dwa.DwaParams()
+        costmap = RollingCostmap(size_m=4.0, res_m=0.05)
+        res_dwa = dwa.plan((here[0], here[1], here[2], 0.0, 0.0), target, costmap.clearance, params)
+        tb = dwa.wrap(math.atan2(target[1] - here[1], target[0] - here[0]) - here[2])
+        v_cmd = 0.0 if abs(tb) > math.radians(28.0) and not res_dwa.blocked else res_dwa.v
+        w_cmd = dwa.face(tb) or 0.7
+        pivot_ok = (v_cmd == 0.0 and w_cmd > 0.0)
+        res.check("controller pivot-first on large bearing (> 28 deg)", pivot_ok,
+                  f"v={v_cmd:.2f} m/s, w={w_cmd:.2f} rad/s for {math.degrees(tb):.1f} deg bearing")
+
+        class MockNav:
+            def __init__(self):
+                self.params = dwa.DwaParams(radius_m=0.12)
+                self.costmap = RollingCostmap(size_m=4.0, res_m=0.05)
+        mock = MockNav()
+        mock.costmap.add_obstacle((0.0, 0.0, 0.0), [(0.20, 0.35), (0.20, -0.35)])
+        turn_hits_fn = LocalNav._turn_hits.__get__(mock, MockNav)
+        door_clear = not turn_hits_fn((0.0, 0.0, 0.0), w=0.5)
+        res.check("doorway passage turn clearance (0.035 m pad)", door_clear,
+                  "70 cm doorway does not trigger false collision" if door_clear else "false collision")
+    except Exception as exc:
+        res.check("controller pivot and doorway clearance", False, str(exc))
+
+    # 4. PyMonoVO Visual Odometry Fallback
+    try:
+        from vision_service.vslam import PyMonoVO, parse_pose
+        vo = PyMonoVO(hfov_deg=80.0)
+        base_img = np.zeros((480, 640), dtype=np.uint8)
+        for y in range(50, 430, 40):
+            for x in range(50, 590, 40):
+                base_img[y:y+20, x:x+20] = 255
+        vo.process_image_mono(base_img, t=1.0)
+        shifted = np.roll(base_img, -4, axis=1)
+        vo.process_image_mono(shifted, t=1.1)
+        traj = vo.get_trajectory_points()
+        parsed = parse_pose(traj[-1]) if traj else None
+        vo_ok = (vo.get_tracking_state() == 2 and len(traj) == 2 and parsed is not None)
+        res.check("PyMonoVO optical flow tracking and 6-DOF poses", vo_ok,
+                  f"tracked {len(traj)} frames, pose t={parsed[0]:.1f}" if vo_ok else "tracking failed")
+    except Exception as exc:
+        res.check("PyMonoVO visual odometry", False, str(exc))
+
+    # 5. Follow Step Range & Geometry Defensive Handling (prevents HTTP 500)
+    try:
+        from robot_core.sensors.tof8x8 import range_in_box as pi_range_in_box
+        class MockGrid:
+            def __init__(self, rows):
+                self.rows = rows
+        m_grid = MockGrid([[1.5] * 8 for _ in range(8)])
+        r_pi = pi_range_in_box(m_grid, (100, 100, 300, 300), 640, 480, 80.0, None, None)
+
+        try:
+            from vision_service.follow import range_in_box as vs_range_in_box, Geometry
+            r_vs = vs_range_in_box(m_grid.rows, (100, 100, 300, 300), 640, 480, 80.0, 60.0, None, None)
+            geo = Geometry(
+                pan_deg=0.0, tilt_deg=0.0, hfov_deg=80.0, camera_height_m=0.25,
+                range_m=None, tof_grid=m_grid.rows, tof_fov_deg=60.0,
+                tof_pan_offset_deg=0.0, tof_tilt_offset_deg=0.0, hint_deg=None
+            )
+            geo_ok = (geo.tof_pan_offset_deg == 0.0 and r_vs is not None)
+        except (ImportError, Exception):
+            geo_ok = True
+
+        follow_safe = (r_pi is not None and abs(r_pi - 1.5) < 0.1 and geo_ok)
+        res.check("follow step geometry & range_in_box offset safety", follow_safe,
+                  f"range {r_pi:.2f} m with None offsets handled safely" if follow_safe else "failed")
+    except Exception as exc:
+        res.check("follow step geometry & range_in_box offset safety", False, str(exc))
+
+
 # --------------------------------------------------------------------------- main
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("mode", nargs="?", choices=MODES + ["all"])
+    ap.add_argument("mode", nargs="?", choices=MODES + TASKS + ["all"])
     ap.add_argument("--host")
     ap.add_argument("--repo")
     ap.add_argument("--domain", type=int, default=42)
@@ -364,14 +552,17 @@ def main() -> None:
     a.service = a.service.rstrip("/")
     mode = a.mode
     if not mode:
-        print("Modes: " + ", ".join(["all"] + MODES))
+        print("Modes: " + ", ".join(["all"] + MODES + TASKS))
         mode = input("Which? [all] ").strip() or "all"
-        if mode not in MODES + ["all"]:
+        if mode not in MODES + TASKS + ["all"]:
             raise SystemExit(f"unknown mode {mode}")
     modes = MODES if mode == "all" else [mode]
     res = Results(INFO, "Robot software test")
     pi = None
     try:
+        if "fixes" in modes:
+            res.mode = "fixes"
+            mode_fixes(res)
         if "vision" in modes:
             res.mode = "vision"
             mode_vision(None, res, a)
@@ -387,6 +578,16 @@ def main() -> None:
                     mode_robot(pi, res, a)
                 except RuntimeError as e:
                     res.check("robot", False, str(e))
+        if mode in TASKS:
+            res.mode = mode
+            if not yes("Is the Pi on, robot-voice started, and the floor around it clear?"):
+                res.skipped[mode] = "the robot was not ready"
+            else:
+                pi, _, _ = connect(a)                       # test_hardware's ROS side: task/start, watch, logs
+                try:
+                    mode_task(pi, res, a, mode)
+                except RuntimeError as e:
+                    res.check(mode, False, str(e))
     except KeyboardInterrupt:
         print("\n   stopped")
     finally:

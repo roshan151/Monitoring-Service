@@ -14,13 +14,13 @@ test_software.py is its partner: the software end to end, nothing moves.
     python test_hardware.py all          stack, topics, mac, moves, follow, logs
     python test_hardware.py stack        robot-voice running, every node up, firmware (TF-Luna), no fatal since start
     python test_hardware.py topics       /odom and /motion_health arrive, robot idle and level
-    python test_hardware.py mac          the Pi reaches the Vision-Microservice; debug uploads arriving
+    python test_hardware.py mac          the Pi reaches the Vision-And-Planning; debug uploads arriving
     python test_hardware.py moves        turn 90 right/left, drive 30 cm out/back, e-stop mid-drive   (floor, 1 m clear)
     python test_hardware.py follow       you say "follow me": frames keep coming, it drives to you; stop; voice back
     python test_hardware.py logs         warnings and errors in logs.json since robot-voice started
 
 Options: --host user@pi and --repo (shared with calibrate.py in .calibrate.json),
---service http://127.0.0.1:8080 (this Mac's Vision-Microservice), --domain 42 (ROS_DOMAIN_ID)
+--service http://127.0.0.1:8080 (this Mac's Vision-And-Planning), --domain 42 (ROS_DOMAIN_ID)
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib import request
 
-from calibrate import CONFIG, Pi as _CalibratePi, countdown, yes
+from calibrate_and_apply import CONFIG, Pi as _CalibratePi, countdown, yes
 
 HERE = Path(__file__).resolve().parent
 MODES = ["stack", "topics", "mac", "moves", "follow", "logs"]
@@ -104,6 +104,7 @@ node.create_subscription(MotionHealth, "motion_health", on_health, 10)
 clients = {"drive": ActionClient(node, Drive, "drive"), "turn": ActionClient(node, Turn, "turn")}
 estop = node.create_client(Trigger, "estop")
 task_stop = node.create_client(Trigger, "task/stop")
+task_start = {t: node.create_client(Trigger, f"task/{t}") for t in ("follow", "explore")}
 ex = MultiThreadedExecutor(num_threads=2)
 ex.add_node(node)
 threading.Thread(target=ex.spin, daemon=True).start()
@@ -205,6 +206,13 @@ def cmd_task_stop(a):
         raise RuntimeError("/task/stop not found (voice node down?)")
     r = wait(task_stop.call_async(Trigger.Request()), 3.0)
     return {"message": r.message if r else None, "now": now()}
+
+def cmd_task_start(a):
+    c = task_start[a["task"]]
+    if not c.wait_for_service(timeout_sec=3.0):
+        raise RuntimeError(f"/task/{a['task']} not found: pull Robot-RPi-Core on the robot and restart robot-voice")
+    r = wait(c.call_async(Trigger.Request()), 3.0)
+    return {"ok": bool(r and r.success), "message": r.message if r else "no answer in 3 s", "now": now()}
 
 def cmd_mac(a):
     ip = (os.environ.get("SSH_CLIENT") or "").split(" ")[0]
@@ -468,7 +476,7 @@ def mode_topics(pi: Pi, res: Results, a) -> None:
 
 
 def mode_mac(pi: Pi, res: Results, a) -> None:
-    print("\n== mac: Pi -> Vision-Microservice")
+    print("\n== mac: Pi -> Vision-And-Planning")
     port = int(a.service.rsplit(":", 1)[-1]) if a.service.count(":") > 1 else 8080
     m = pi("mac", port=port)
     res.data["mac"] = m

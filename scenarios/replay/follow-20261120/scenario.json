@@ -1,0 +1,14 @@
+{
+  "about": "Nov 20 follow: at 18-27 s turned left onto the Mac's long way round instead of following through a corner door (mapped 0.5 m, shut for the Mac's 0.27-0.29 m clearance) and lost him until he came back; at 68-82 s swung left-right at a wall corner 0.2 m to its right (test_scenarios door20, corner20)",
+  "session": "20261120-114136",
+  "saved": "2026-11-20T17:59:08",
+  "limits": {
+    "mac_bad_accepted": 0,
+    "pi_goal_jumps": 0,
+    "pi_placed_too_near": 0,
+    "pivot_flip_episodes": 1
+  },
+  "known": {
+    "pivot_flip_episodes": "1 left, 2 as recorded: the wall corner at 68-82 s (test_scenarios corner20, known): passing it needs the body's rectangle, not the 0.177 m circle (EXPLORE-PLAN phase C). Target 0."
+  }
+}
