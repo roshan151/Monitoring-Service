@@ -650,6 +650,27 @@ def mode_fixes(res: Results) -> None:
     except Exception as exc:
         res.check("gimbal-mounted IMU axes & Head.project", False, str(exc))
 
+    try:
+        import tempfile
+        from vision_service.plants import foliage_health
+        from vision_service.recon import write_ortho_png
+        green_img = np.zeros((100, 100, 3), dtype=np.uint8)
+        green_img[:, :] = (40, 180, 45)
+        dry_img = np.zeros((100, 100, 3), dtype=np.uint8)
+        dry_img[:, :] = (190, 155, 40)
+        hg, hd = foliage_health(green_img), foliage_health(dry_img)
+        verts = np.array([[0.0, 0.0, 0.2], [0.0, 0.0, 2.2]], dtype=np.float32)  # floor + ceiling
+        cols = np.array([[30, 200, 40], [250, 250, 250]], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as td:
+            op = write_ortho_png(Path(td) / "ortho.png", verts, cols, max_z_m=1.6)
+            ortho_ok = op is not None and op.exists() and op.stat().st_size > 0
+        hp_ok = (hg["score"] is not None and hg["score"] >= 90.0
+                 and hd["score"] is not None and hd["score"] <= 10.0 and ortho_ok)
+        res.check("plant foliage health index & top-down ortho PNG render", hp_ok,
+                  f"green={hg['score']}, dry={hd['score']}, ortho={ortho_ok}")
+    except Exception as exc:
+        res.check("plant foliage health index & top-down ortho PNG", False, str(exc))
+
     # 4. PyMonoVO Visual Odometry Fallback
     try:
         from vision_service.vslam import PyMonoVO, parse_pose
