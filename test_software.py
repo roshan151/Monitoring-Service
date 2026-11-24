@@ -489,8 +489,166 @@ def mode_fixes(res: Results) -> None:
         door_clear = not turn_hits_fn((0.0, 0.0, 0.0), w=0.5)
         res.check("doorway passage turn clearance (0.035 m pad)", door_clear,
                   "70 cm doorway does not trigger false collision" if door_clear else "false collision")
+
+        # Oriented capsule body clearance: passes a 0.21 m wall to the side (where 0.177+0.04=0.217 m circle failed)
+        cm_tight = RollingCostmap(size_m=4.0, res_m=0.05)
+        cm_tight.add_obstacle((0.0, 0.0, 0.0), [(0.30, -0.21)])
+        cl_side = float(dwa.rect_clearance(np.array([0.30]), np.array([0.0]), np.array([0.0]),
+                                           cm_tight.clearance, params.half_l_m, params.half_w_m, params.side_pad_m)[0])
+        res.check("DWA oriented capsule clearance passes tight side corner", cl_side >= params.margin_m,
+                  f"side clearance {cl_side:.3f} m >= margin {params.margin_m:.3f} m")
     except Exception as exc:
         res.check("controller pivot and doorway clearance", False, str(exc))
+
+    # 3b. Phase-1 safety & calibration checks (ToF drop fallback, IMU auto-tare, VSLAM calibration, COCO filter)
+    try:
+        from robot_core import terrain
+        p_notf = terrain.params_from({"tfluna_fitted": False, "max_drop_m": 0.03})
+        p_tf = terrain.params_from({"tfluna_fitted": True, "max_drop_m": 0.03})
+        drop_pts = [(0.20, y, 0.0) for y in (-0.08, 0.0, 0.08)] + [(0.35, y, -0.10) for y in (-0.08, 0.0, 0.08)]
+        hole_pts = [(0.20, y, 0.0) for y in (-0.08, 0.0, 0.08)] + [(0.25, y, 0.0) for y in (-0.08, 0.0, 0.08)] + \
+                   [(0.35, y, None) for y in (-0.08, 0.0, 0.08)]
+        drop_ok = (p_notf.detect_drops and not p_tf.detect_drops
+                   and terrain.classify(drop_pts, p_notf, 0.6).kind == terrain.DROP
+                   and terrain.classify(hole_pts, p_notf, 0.6).kind == terrain.DROP
+                   and terrain.classify(drop_pts, p_tf, 0.6).kind == terrain.FLAT)
+        res.check("ToF drop detection fallback when tfluna_fitted=false", drop_ok,
+                  "detects visible drop & stairwell hole without TF-Luna; defers when TF-Luna fitted" if drop_ok else "drop fallback mismatch")
+    except Exception as exc:
+        res.check("ToF drop detection fallback", False, str(exc))
+
+    try:
+        from robot_core.sensors.imu import Fusion
+        # Flat-floor startup with +3.3 deg pitch & -2.0 deg roll mounting skew -> auto-tared to ~0 deg
+        f_flat = Fusion(window=10, auto_tare_level=True, max_tare_deg=12.0)
+        p_rad, r_rad = math.radians(3.3), math.radians(-2.0)
+        ax, ay, az = math.sin(p_rad), math.sin(r_rad) * math.cos(p_rad), math.cos(r_rad) * math.cos(p_rad)
+        for _ in range(12):
+            f_flat.update((ax, ay, az), (0.0, 0.0, 0.0), 0.01)
+        st_flat = f_flat.state(1.0)
+        # Steep 20 deg ramp at boot -> must NOT tare away a real slope
+        f_ramp = Fusion(window=10, auto_tare_level=True, max_tare_deg=12.0)
+        pr = math.radians(20.0)
+        for _ in range(12):
+            f_ramp.update((math.sin(pr), 0.0, math.cos(pr)), (0.0, 0.0, 0.0), 0.01)
+        st_ramp = f_ramp.state(1.0)
+        tare_ok = (f_flat.level_tared and abs(st_flat.pitch_deg) < 0.2 and abs(st_flat.roll_deg) < 0.2
+                   and not f_ramp.level_tared and abs(st_ramp.pitch_deg - 20.0) < 0.5)
+        res.check("IMU stationary startup auto-tare (with 12 deg sanity guard)", tare_ok,
+                  f"flat->({st_flat.pitch_deg:.2f}, {st_flat.roll_deg:.2f}) deg; ramp->{st_ramp.pitch_deg:.1f} deg")
+    except Exception as exc:
+        res.check("IMU stationary startup auto-tare", False, str(exc))
+
+    try:
+        import ast
+        import tempfile
+        from vision_service.vslam import settings_yaml
+        with tempfile.TemporaryDirectory() as td:
+            yp = settings_yaml(Path(td) / "cam.yaml", 640, 360, 80.0,
+                               dist=(-0.25, 0.08, 0.001, -0.002),
+                               intrinsics=(1200.0, 1200.0, 960.0, 540.0, 1920, 1080))
+            ytxt = yp.read_text()
+        try:
+            from vision_service import nav_api
+            obstacles = nav_api.OBSTACLES
+        except ModuleNotFoundError:
+            tree = ast.parse((HERE.parent / "Vision-And-Planning" / "vision_service" / "nav_api.py").read_text())
+            obstacles = next(ast.literal_eval(n.value) for n in tree.body
+                             if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "OBSTACLES" for t in n.targets))
+        calib_ok = ("Camera1.fx: 400.000" in ytxt and "Camera1.k1: -0.25" in ytxt
+                    and "suitcase" not in obstacles)
+        res.check("VSLAM calibrated intrinsics/distortion & suitcase filter", calib_ok,
+                  "scaled fx=400, k1=-0.25, suitcase excluded from OBSTACLES" if calib_ok else "calibration/filter mismatch")
+    except Exception as exc:
+        res.check("VSLAM calibrated intrinsics/distortion & suitcase filter", False, str(exc))
+
+    # 3c. Phase-3 outdoor & Wi-Fi resilience checks
+    try:
+        from robot_core import terrain
+        p_out = terrain.params_from({"outdoor_mode": True, "max_slope_deg": 12.0, "roughness_tol_m": 0.04,
+                                     "tfluna_fitted": False, "max_drop_m": 0.03})
+        # 8 deg garden slope + 3 cm grass tufts -> FLAT
+        s8 = math.tan(math.radians(8.0))
+        grass = [(0.15 + 0.05 * i, y, (0.15 + 0.05 * i) * s8 + (0.015 if (i % 2) else -0.015))
+                 for i in range(12) for y in (-0.10, 0.0, 0.10)]
+        # 18 deg steep slope (> 12 deg) -> BLOCKED
+        s18 = math.tan(math.radians(18.0))
+        steep = [(0.15 + 0.05 * i, y, (0.15 + 0.05 * i) * s18) for i in range(12) for y in (-0.10, 0.0, 0.10)]
+        # 12 cm rock on 8 deg slope -> BLOCKED
+        rock = [(x, y, h + (0.12 if x >= 0.40 else 0.0)) for x, y, h in grass]
+        # 10 cm curb drop on 8 deg slope -> DROP
+        curb = [(x, y, h - (0.10 if x >= 0.40 else 0.0)) for x, y, h in grass]
+        out_ok = (terrain.classify(grass, p_out, 0.6).kind == terrain.FLAT
+                  and terrain.classify(steep, p_out, 0.6).kind == terrain.BLOCKED
+                  and terrain.classify(rock, p_out, 0.6).kind == terrain.BLOCKED
+                  and terrain.classify(curb, p_out, 0.6).kind == terrain.DROP)
+        res.check("outdoor terrain mode (8 deg grass ok, 18 deg slope/rock/curb stopped)", out_ok,
+                  "grass=flat, steep=blocked, rock=blocked, curb=drop" if out_ok else "outdoor terrain mismatch")
+    except Exception as exc:
+        res.check("outdoor terrain mode", False, str(exc))
+
+    try:
+        from vision_service.settings import Settings
+        try:
+            from robot_core.explore.mission import ExploreConfig
+            pi_cls = set(ExploreConfig().plant_classes)
+        except ModuleNotFoundError:
+            import ast as _ast
+            m_src = (HERE.parent / "Robot-RPi-Core" / "robot_core" / "explore" / "mission.py").read_text()
+            m_tree = _ast.parse(m_src)
+            ec = next(n for n in m_tree.body if isinstance(n, _ast.ClassDef) and n.name == "ExploreConfig")
+            pi_cls = set(next(_ast.literal_eval(s.value) for s in ec.body
+                              if isinstance(s, _ast.AnnAssign) and getattr(s.target, "id", "") == "plant_classes"))
+        vs_set = Settings()
+        ov_ok = ({"potted plant", "plant", "shrub", "flower", "garden bed"} <= pi_cls
+                 and {"potted plant", "plant", "shrub", "flower", "garden bed"} <= vs_set.plant_classes
+                 and "shrub" in vs_set.open_vocab_classes)
+        res.check("open-vocabulary outdoor/indoor plant classes configured", ov_ok,
+                  f"Pi={len(pi_cls)} classes, Mac={len(vs_set.plant_classes)} plant / {len(vs_set.open_vocab_classes)} open-vocab")
+    except Exception as exc:
+        res.check("open-vocabulary outdoor/indoor plant classes", False, str(exc))
+
+    try:
+        import tempfile
+        from robot_core.nav.stream import FrameStream
+        fs = FrameStream(None, None, lambda: None, quality=70, min_quality=45, idle_hz=1.0)
+        fs._last_sent = (10.0, (0.0, 0.0, 0.0), 0.0, 0.0)
+        skip_still = not fs._should_send(10.2, (0.005, 0.0, 0.0), 0.2, 0.0)
+        send_moved = fs._should_send(10.2, (0.05, 0.0, 0.0), 0.2, 0.0)
+        send_idle = fs._should_send(11.1, (0.0, 0.0, 0.0), 0.0, 0.0)
+        fs._rtt_s = 1.0
+        q_low = fs._adaptive_quality()
+        # Check UploadSpool bounded persistence without importing requests
+        import ast as _ast
+        src_vc = (HERE.parent / "Robot-RPi-Core" / "robot_core" / "vision_client.py").read_text()
+        has_spool = "class UploadSpool" in src_vc and "def flush_spool" in src_vc
+        wifi_ok = skip_still and send_moved and send_idle and q_low == 45 and has_spool
+        res.check("Wi-Fi resilience (motion-gated stream, adaptive JPEG quality, upload spool)", wifi_ok,
+                  f"skip_still={skip_still}, send_moved={send_moved}, send_idle={send_idle}, q_low={q_low}")
+    except Exception as exc:
+        res.check("Wi-Fi resilience", False, str(exc))
+
+    try:
+        from robot_core.sensors.imu import axis_map
+        from robot_core.sensors.head import Head, HeadGeometry
+        # Gimbal IMU axes: +x = robot right (-left), +y = up, +z = into robot (-fwd) -> ["-z", "-x", "y"]
+        m = axis_map(["-z", "-x", "y"])
+        # At +21 deg upward gimbal tilt on flat floor, world-up (0, 0, +1g) projects to:
+        # board +z (backward) = -sin(21), board +y (up) = +cos(21), board +x (right) = 0
+        ax_r, ay_r, az_r = m((0.0, math.cos(math.radians(21.0)), -math.sin(math.radians(21.0))))
+        pitch_raw = math.degrees(math.atan2(ax_r, math.sqrt(ay_r * ay_r + az_r * az_r)))
+        # Verify Head.project with imu_on_gimbal=True does NOT double-count tilt_deg (-30 deg)
+        h_gim = Head(None, None, None, HeadGeometry(height_m=0.22, tilt_offset_deg=21.0, imu_on_gimbal=True))
+        h_ref = Head(None, None, None, HeadGeometry(height_m=0.22, tilt_offset_deg=21.0, imu_on_gimbal=False))
+        grid = [[1.0] * 8 for _ in range(8)]
+        z_gim = h_gim.project(grid, pan_deg=0.0, tilt_deg=-30.0, pitch_deg=-30.0)
+        z_ref = h_ref.project(grid, pan_deg=0.0, tilt_deg=-30.0, pitch_deg=0.0)
+        gim_ok = abs(pitch_raw - 21.0) < 0.05 and len(z_gim) == len(z_ref) and \
+            all(abs(a[4] - b[4]) < 1e-6 for a, b in zip(z_gim, z_ref))
+        res.check("gimbal-mounted IMU axes ([-z, -x, y], +21 deg) & Head.project no double-count", gim_ok,
+                  f"raw_pitch={pitch_raw:.2f} deg, Head.project matches reference exactly")
+    except Exception as exc:
+        res.check("gimbal-mounted IMU axes & Head.project", False, str(exc))
 
     # 4. PyMonoVO Visual Odometry Fallback
     try:

@@ -425,11 +425,12 @@ def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 def dwa_fan(rc, pose, v0, costmap, prm, n: int = 9):
     """Arcs at top speed across the turn rates, each marked admissible (keeps radius + margin) or not:
     which ways are open from here."""
-    p = rc.dwa.DwaParams(radius_m=math.hypot(prm["robot_width_m"] / 2.0, prm["robot_width_m"] / 2.0))   # as LocalNav
+    half = prm["robot_width_m"] / 2.0
+    p = rc.dwa.DwaParams(radius_m=math.hypot(half, half), half_l_m=half, half_w_m=half)   # as LocalNav
     vs = np.full(n, p.max_v)
     ws = np.linspace(-p.max_w, p.max_w, n)
-    xs, ys, _ = rc.dwa.arcs(pose[0], pose[1], pose[2], vs, ws, p.horizon_s, p.dt)
-    clear = costmap.clearance(xs.ravel(), ys.ravel()).reshape(xs.shape).min(axis=1) - p.radius_m
+    xs, ys, ths = rc.dwa.arcs(pose[0], pose[1], pose[2], vs, ws, p.horizon_s, p.dt)
+    clear = rc.dwa.rect_clearance(xs, ys, ths, costmap.clearance, p.half_l_m, p.half_w_m, p.side_pad_m).min(axis=1)
     return [(xs[i], ys[i], clear[i] >= p.margin_m) for i in range(n)], p
 
 

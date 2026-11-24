@@ -83,14 +83,7 @@ RULES = {
 # it for room beyond DWA's own margin, the fallback turn followed the target's side, a wedged robot backs off
 # (no_progress), and skipping ahead along a path keeps clear of corners. pivot_commit and keep_plan were tried
 # and removed: no scenario needed them and doorway2 and the replay were better without.
-KNOWN: dict = {
-    # Both from the Nov 20 follow (Vision-And-Planning debug/20261120-114136). Fixed by passage handling (EXPLORE-PLAN
-    # phase C: the body's rectangle, not its 0.177 m circle, for passing walls and doors).
-    "door20": "the door maps 0.5 m wide (ToF cones draw the frame into it); the Mac plans 0.27-0.29 m clear of walls, "
-              "so its path goes round the long way (left) and the robot follows it, though DWA (0.217 m) could pass",
-    "corner20": "0.2 m from a wall corner: the Mac's step aside (0.17 m) is dropped as reached; the line on passes the "
-                "corner at exactly DWA's 0.217 m, so DWA veers left and the pivot turns it right, again and again",
-}
+KNOWN: dict = {}
 
 
 def _sync_planning(rc) -> None:

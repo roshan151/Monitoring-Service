@@ -246,8 +246,14 @@ python3 test_scenarios.py doorway chair                 # some of them; --list n
 - **test_scenarios.py** runs `navigation_debugging.py --sim`'s simulator headless and deterministic
   (planning inline), with bumps reported after 0.3 s of contact like the drivetrain's stall check, and a
   pass rule per room (got there, touched nothing, no left-right-left turns, braked when it had to). A
-  picture of each room's end goes to `test-runs/sim-<time>/`. Rooms that fail for a known reason go in
-  `KNOWN` and are reported separately, so a new failure stands out.
+  picture of each room's end goes to `test-runs/sim-<time>/`. `door20` and `corner20` were promoted out
+  of `KNOWN` once DWA switched to oriented capsule body clearance (`dwa.rect_clearance`). Rooms that fail
+  for a known reason go in `KNOWN` and are reported separately, so a new failure stands out.
+- **test_software.py `fixes`** additionally verifies offline Phase-1 & Phase-3 safety, calibration,
+  and outdoor/Wi-Fi regressions: DWA oriented capsule clearance, ToF drop-detection fallback when
+  `tfluna_fitted: false`, IMU stationary startup auto-tare (with ±12° ramp guard), VSLAM calibrated
+  intrinsics/distortion + `"suitcase"` filter, outdoor slope/roughness terrain classification,
+  open-vocabulary plant classes, and motion-gated/adaptive Wi-Fi streaming + upload spool.
 
 **The habit:** an incident on the robot → find it in the scorecard → freeze the session with
 `test_replay.py --save` (or write the situation as a simulated room) → see the test fail → fix →

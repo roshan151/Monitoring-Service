@@ -597,13 +597,21 @@ def mode_encoders(pi: Pi, res: Results) -> None:
 
 def mode_imu(pi: Pi, res: Results) -> None:
     print("\n== imu")
+    on_gimbal = bool(res.cur["drivetrain"].get("imu_on_gimbal") or res.cur["explorer"].get("imu_on_gimbal"))
+    expected_pitch = float(res.cur["explorer"].get("head_tilt_offset_deg") or 0.0) if on_gimbal else 0.0
+    if on_gimbal:
+        print("   centering gimbal to pan=0, tilt=0 before IMU calibration...")
+        g = pi("gimbal_move", pan=0.0, tilt=0.0)
+        print(f"   gimbal at pan={g['pan_deg']:+.1f} deg, tilt={g['tilt_deg']:+.1f} deg")
     countdown(10, "Robot on flat floor, still")
     lv = pi("imu_read", seconds=3)
-    res.check("IMU level", abs(lv["pitch_deg"]) < 15 and abs(lv["roll_deg"]) < 3,
-              f"pitch {lv['pitch_deg']:+.1f}, roll {lv['roll_deg']:+.1f} on flat floor (roll should be near 0; "
-              "over 15 deg pitch: is the board mounted as imu_axes says?)")
+    pitch_err = lv["pitch_deg"] - expected_pitch
+    res.check("IMU level", abs(pitch_err) < 15 and abs(lv["roll_deg"]) < 3,
+              f"raw pitch {lv['pitch_deg']:+.1f} (expected {expected_pitch:+.1f} -> err {pitch_err:+.1f}), "
+              f"roll {lv['roll_deg']:+.1f} on flat floor (roll should be near 0; "
+              "over 15 deg pitch error: is the board mounted as imu_axes says?)")
     res.set("/drivetrain", "imu_pitch_offset_deg", round(lv["pitch_deg"], 1),
-            "pitch read on flat floor: taken off every reading, so flat reads 0")
+            "pitch read on flat floor (at gimbal tilt=0): taken off every reading, so flat reads 0")
     for what, key, label in (("Lift the FRONT about 3 cm and hold it", "pitch_deg", "pitch"),
                              ("Lift the LEFT side about 3 cm and hold it", "roll_deg", "roll")):
         countdown(12, what + " (it measures for 4 s once it says go)")
